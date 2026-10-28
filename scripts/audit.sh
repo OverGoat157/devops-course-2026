@@ -59,6 +59,14 @@ check 'Сертификат действует ещё минимум 30 дней
 if WRITABLE=$(sudo find /var/www/devops-site -perm -o+w -print 2>/dev/null) && [[ -z "$WRITABLE" ]] && [[ "$(sudo stat -c '%a' /etc/ssl/private/devops.key 2>/dev/null)" == 600 ]]; then WEB_PERMISSIONS=yes; else WEB_PERMISSIONS=no; fi
 check 'Нет записи для всех; права TLS-ключа 600' 'yes' "$WEB_PERMISSIONS"
 
+printf '[5] Контейнеризация\n'
+check 'Docker активен' 'active' "$(systemctl is-active docker 2>/dev/null || true)"
+DB_HEALTH=$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null || true)
+check 'PostgreSQL healthy' 'healthy' "$DB_HEALTH"
+PORT_ISOLATION=$(ss -H -tln | awk '$4 ~ /:(5000|5432)$/ && $4 !~ /^127[.]0[.]0[.]1:(5000|5432)$/ {bad=1} END {print bad ? "no" : "yes"}')
+check '5000/5432 недоступны на внешних адресах' 'yes' "$PORT_ISOLATION"
+check 'Права серверного .env равны 600' '600' "$(stat -c '%a' "$HOME/app/.env" 2>/dev/null || true)"
+
 printf 'Пройдено: %s, не пройдено: %s\n' "$PASS" "$FAIL"
 if [[ "$FAIL" -eq 0 ]]; then
     exit 0
