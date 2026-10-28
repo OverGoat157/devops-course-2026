@@ -286,3 +286,118 @@ curl --cacert ~/devops.crt -I https://devops.local/
 Аудит дополнен четырьмя проверками: nginx активен; nginx -t успешен; сертификат годен минимум 30 дней; нет world-writable файлов и TLS-ключ имеет права 600. Всего 10 проверок; корректная конфигурация — код 0. `CERT_MIN_SECONDS=63072000` проверяет отказ по сроку, временный chmod 666 — отказ по правам, оба дают код 1; исходные значения восстановлены.
 
 Снимок `04-nginx-https` создан после HTTPS и до rsync/самостоятельной части. Текущее состояние дополнительно содержит сайт, deploy.sh и расширенный audit.sh. Для восстановления после снимка: доставить site/ через deploy.sh (или rsync с --chmod), скопировать audit.sh в ~/scripts/ и проверить аудит. Для восстановления с 01 сначала выполнить разделы 1–7, затем установить nginx/rsync, создать каталог и конфигурацию выше, выпустить сертификат, включить сайт и проверить HTTPS.
+
+## 9. Контейнеризация
+
+Практика 7 выполнена 28.10.2026 на той же VM. Docker Engine 29.9.2, Docker Compose v5.6.1, Buildx 0.38.1 установлены из официального apt-репозитория https://download.docker.com/linux/ubuntu (noble/stable), а не из docker.io. Ключ репозитория: /etc/apt/keyrings/docker.asc; источник: /etc/apt/sources.list.d/docker.sources. Команды установки приведены в официальной инструкции https://docs.docker.com/engine/install/ubuntu/ . Служба docker включена в автозагрузку.
+
+В группе docker только devops (UID 1001); он уже входит в sudo. После usermod -aG docker devops создана новая SSH-сессия, hello-world выполнен без sudo. Членство docker предоставляет фактический root-доступ к VM, поскольку позволяет управлять Docker socket.
+
+Исходники: app/ в репозитории, серверный проект: /home/devops/app. Образ devops-app:1.0 на базе python:3.12-slim; Flask 3.0.3, psycopg2-binary 2.9.9, gunicorn 22.0.0 соответствуют заданию. Процесс работает от app, UID/GID 999, а файлы образа принадлежат root и доступны app только для чтения. Изменённый текст: Hello from Docker, Епифанов!
+
+Dockerfile:
+
+```dockerfile
+FROM python:3.12-slim
+
+RUN useradd --system --no-create-home app
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+
+USER app
+EXPOSE 5000
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--access-logfile", "-", "app:app"]
+```
+
+Порядок COPY сохраняет кэш pip при изменении app.py. Первая проверка без СУБД: /health → 200, / → 500 с psycopg2.OperationalError и Connection refused для localhost:5432. В Compose DB_HOST=db использует DNS общей сети; localhost внутри отдельного контейнера относится к нему самому.
+
+Файл /home/devops/app/.env создан только в VM со случайным POSTGRES_PASSWORD (openssl rand -hex 16), владелец devops, права 600. На хост он не копировался. .env исключён из Git и Docker build context; в репозитории только .env.example с заглушкой. Доставка:
+
+```bash
+rsync -avz --delete --exclude=.env --dry-run app/ devops:app/
+rsync -avz --delete --exclude=.env app/ devops:app/
+```
+
+Исключение защищает серверный секрет от удаления при --delete. Создание .env при первом развёртывании, выполнять в VM:
+
+```bash
+cd ~/app
+umask 077
+cp .env.example .env
+chmod 600 .env
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+```
+
+Не повторять генерацию пароля поверх работающей СУБД без согласованной смены пароля в PostgreSQL: env_file не меняет пароль уже инициализированной БД.
+
+Compose:
+
+```yaml
+services:
+  db:
+    image: postgres:16-alpine
+    env_file: .env
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    build: .
+    image: devops-app:1.0
+    env_file: .env
+    ports:
+      - "127.0.0.1:5000:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  db_data:
+
+networks:
+  backend:
+```
+
+- Проект app: контейнеры app-app-1 и app-db-1.
+- Сеть app_backend типа bridge, сервис db разрешается встроенным DNS.
+- Именованный том app_db_data хранит /var/lib/postgresql/data.
+- PostgreSQL: postgres:16-alpine, порт 5432 доступен только внутри сети, на VM не публикуется.
+- Приложение: только 127.0.0.1:5000 → контейнер:5000.
+- depends_on condition: service_healthy ждёт успешного pg_isready; restart: unless-stopped задан обоим сервисам.
+
+Запуск: `cd ~/app && docker compose up -d --build`. Проверки: `docker compose ps`, `docker compose exec -T app id`, `docker compose exec -T app getent hosts db`, `sudo ss -tlnp`. Запросы к / увеличивают Visits. Проверено: down/up сохраняет счётчик через именованный том; down -v на свежих учебных данных удаляет том, первый запрос после нового up возвращает Visits: 1. В итоговом состоянии том сохранён.
+
+Обратный прокси: в HTTPS server /etc/nginx/sites-available/devops-site добавлено:
+
+```nginx
+    location /app/ {
+        proxy_pass http://127.0.0.1:5000/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+```
+
+Применение: `sudo nginx -t && sudo systemctl reload nginx`. Завершающий / заменяет префикс /app/: /app/health передаётся как /health. Статический root /var/www/devops-site и прямой deploy.sh из работы 6 сохранены; / → статическая страница, /app/ → счётчик, /app/health → ok. TLS завершает Nginx, внутри VM к приложению идёт HTTP.
+
+Воспроизведён учебный обход UFW: отдельный контейнер exposed опубликован на 0.0.0.0:5001; при отсутствии правила UFW запрос с хоста к :5001/health дал 200. Docker создаёт NAT/forwarding-правила, обходящие обычную INPUT-политику UFW. После проверки exposed остановлен. Итоговая публикация приложения только на loopback.
+
+Остановка app дала Nginx 502 и connect() failed (111: Connection refused) while connecting to upstream; app затем снова запущен. Это отказ на участке Nginx → приложение, а не ошибка TLS клиента.
+
+Аудит дополнен четырьмя проверками: Docker активен; app-db-1 healthy; ни 5000, ни 5432 не слушаются на адресах, отличных от 127.0.0.1; ~/app/.env имеет 600. Всего 14 проверок. Для отрицательного теста публикация временно изменена на 5000:5000, после up -d аудит дал 1; затем loopback-публикация восстановлена и аудит возвращает 0.
+
+Снимок 05-docker-compose создан после проверки тома и до добавления обратного прокси/расширения аудита. После отката к нему нужно добавить location /app/, проверить/reload Nginx и доставить итоговый audit.sh в ~/scripts/. Для восстановления с 01 сначала выполнить разделы 1–8, установить Docker по официальной инструкции, добавить devops в docker и переподключиться, доставить app с --exclude=.env, создать серверный .env, запустить Compose и проверить HTTPS/аудит.
