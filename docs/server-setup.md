@@ -222,3 +222,67 @@ echo $?
 9. Проверить `ssh devops.local 'hostname -f'`, `sudo ufw status verbose`, `sudo ss -tlnp`. Убедиться, что VM остаётся сохранённой для работы 6.
 
 Пароль student после сброса и пароль devops сохранены только в приватном локальном каталоге пользователя. Они не публикуются в Git.
+
+## 8. Веб-сервер
+
+Практика 6 выполнена 28.10.2026. Перед настройкой проверено восстановление из 01-clean-install по разделам 1–7: настройки восстановлены за 12,5 с, аудит — 6/6, код 0. Полное состояние работы 5 сохранено снимком 03a-practice5-complete.
+
+Пакет: nginx из репозитория Ubuntu, версия 1.24.0; rsync установлен на хосте и в VM. Nginx включён в автозагрузку. Master работает от root, workers — www-data. Доступ с хоста идёт напрямую через Host-only, без проброса портов HTTP.
+
+- Конфигурация: /etc/nginx/sites-available/devops-site; ссылка /etc/nginx/sites-enabled/devops-site.
+- Ссылка sites-enabled/default удалена, исходный sites-available/default сохранён.
+- Каталог /var/www/devops-site: devops:devops, 755; index.html и 404.html — 644. www-data читает содержимое, но не имеет права записи.
+- Логи: /var/log/nginx/devops-site.access.log и /var/log/nginx/devops-site.error.log.
+- TLS-сертификат: /etc/ssl/certs/devops.crt, root:root, 644. Закрытый ключ: /etc/ssl/private/devops.key, root:root, 600; он остаётся исключительно в VM.
+- Сертификат самоподписанный, RSA 2048, срок 365 дней, SAN DNS:devops.local. HSTS не включён.
+
+Команда выпуска:
+
+```bash
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/devops.key \
+  -out /etc/ssl/certs/devops.crt \
+  -subj /CN=devops.local -addext subjectAltName=DNS:devops.local
+sudo chmod 600 /etc/ssl/private/devops.key
+sudo chmod 644 /etc/ssl/certs/devops.crt
+```
+
+Конфигурация ресурса:
+
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name devops.local;
+    return 301 https://$host$request_uri;
+}
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name devops.local;
+    ssl_certificate /etc/ssl/certs/devops.crt;
+    ssl_certificate_key /etc/ssl/private/devops.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    root /var/www/devops-site;
+    index index.html;
+    location / { try_files $uri $uri/ =404; }
+    error_page 404 /404.html;
+    access_log /var/log/nginx/devops-site.access.log;
+    error_log /var/log/nginx/devops-site.error.log;
+}
+```
+
+После каждого изменения: `sudo nginx -t && sudo systemctl reload nginx`. HTTP возвращает 301 на HTTPS; HTTPS — 200, неизвестный путь — собственную страницу 404 с кодом 404. Запрос curl без доверенного сертификата возвращает ошибку 60. Открытый сертификат получен на хост через проверенное SSH-соединение:
+
+```bash
+scp devops:/etc/ssl/certs/devops.crt ~/devops.crt
+curl --cacert ~/devops.crt -I https://devops.local/
+```
+
+Код и страницы: `site/`, деплой: `scripts/deploy.sh [--dry-run]`. Скрипт работает из любого каталога, требует чистый Git и наличие index.html, выполняет один rsync с `--delete --chmod=D755,F644`, использует BatchMode/ConnectTimeout, проверяет HTTPS с --cacert, сообщает короткий SHA и возвращает 0 при успехе, 1 при ошибке. Новый вариант rsync --delete сначала проверен с --dry-run.
+
+Проверены все пять сценариев деплоя, включая staged-изменения. Опыты с правами: файл 600 → 403; каталог 755 → 200, 750 → 403, 744 → 403, 711 → 200. Доставка 666 без --chmod позволила www-data подменить HTML; штатный деплой восстановил страницу и 644/755. Итоговых файлов с правом записи всем нет.
+
+Аудит дополнен четырьмя проверками: nginx активен; nginx -t успешен; сертификат годен минимум 30 дней; нет world-writable файлов и TLS-ключ имеет права 600. Всего 10 проверок; корректная конфигурация — код 0. `CERT_MIN_SECONDS=63072000` проверяет отказ по сроку, временный chmod 666 — отказ по правам, оба дают код 1; исходные значения восстановлены.
+
+Снимок `04-nginx-https` создан после HTTPS и до rsync/самостоятельной части. Текущее состояние дополнительно содержит сайт, deploy.sh и расширенный audit.sh. Для восстановления после снимка: доставить site/ через deploy.sh (или rsync с --chmod), скопировать audit.sh в ~/scripts/ и проверить аудит. Для восстановления с 01 сначала выполнить разделы 1–7, затем установить nginx/rsync, создать каталог и конфигурацию выше, выпустить сертификат, включить сайт и проверить HTTPS.
