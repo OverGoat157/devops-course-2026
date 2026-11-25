@@ -1,0 +1,6 @@
+---
+app_image: ghcr.io/overgoat157/devops-ci-app
+app_tag: 956311758f220fe8eefe63e8a42e22c9580da9e5
+app_container_name: devops-ci-app
+app_host_port: 5000
+app_internal_port: 5000
